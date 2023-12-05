@@ -4,13 +4,13 @@
 </a>  
 
 ---
-<a href="https://github.com/yarden-zamir/me">
+<a href="https://github.com/yarden-zamir/obsidian-zola-plus">
   <img align="center" src="https://github-stats.yarden-zamir.com/api/pin/?username=Yarden-zamir&repo=obsidian-zola-plus&theme=calm&show_icons=true&border_radius=20" />
 </a>
-<a href="https://github.com/yarden-zamir/me">
+<a href="https://github.com/yarden-zamir/create-prepare-to-dye">
   <img align="center" src="https://github-stats.yarden-zamir.com/api/pin/?username=Yarden-zamir&repo=create-prepare-to-dye&theme=calm&show_icons=true&border_radius=20" />
 </a>
-<a href="https://github.com/yarden-zamir/me">
+<a href="https://github.com/yarden-zamir/install-mssql-odbc">
   <img align="center" src="https://github-stats.yarden-zamir.com/api/pin/?username=Yarden-zamir&repo=install-mssql-odbc&theme=calm&show_icons=true&border_radius=20" />
 </a>
 <!-- <a href="https://github.com/Yarden-zamir">
