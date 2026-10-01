@@ -16,9 +16,12 @@ const GRAVEYARD_MS = 2 * 365.25 * 24 * 60 * 60 * 1000;
 // Housekeeping commits that do not count as work on a project (the licensing pass of 2026-10-01).
 // Limit: a later real commit with the same headline is ignored too. Revisit if license commits recur.
 const IGNORED_HEADLINES = new Set(["chore: add MIT license"]);
-// The free Workers plan allows 50 subrequests per run. The run uses about 12 for
-// GitHub and Cloudflare, so it checks at most this many sites and rotates through the rest.
-const SITE_CHECKS_PER_RUN = 30;
+// The free Workers plan allows 50 subrequests per run. Budget today: about 4 for GitHub,
+// 2 + one per zone for Cloudflare, CERT_REQUESTS_PER_RUN for certificate logs, and
+// SITE_CHECKS_PER_RUN site checks that rotate through all hosts.
+// Limit: about 10 more zones or 400 more repos fit. Revisit when a run hits the limit.
+const SITE_CHECKS_PER_RUN = 22;
+const CERT_REQUESTS_PER_RUN = 6;
 const SITE_LOOKBACK_DAYS = 7;
 // Hosts that stay off the profile. Each entry hides that host and all its subdomains.
 const HIDDEN = ["example.yarden-zamir.com", "shahar-zamir.com"];
@@ -161,6 +164,7 @@ async function cloudflare(token, path, init = {}) {
 // Limit: a site with no DNS lookups in SITE_LOOKBACK_DAYS and no own record drops off.
 async function candidateHosts(token) {
   const zones = (await cloudflare(token, "/zones?per_page=50")).result;
+  if (zones.length === 50) throw new Error("50 or more zones: paginate the zone list");
   const hosts = new Set();
   for (const zone of zones) {
     const records = (await cloudflare(token, `/zones/${zone.id}/dns_records?per_page=500`)).result;
@@ -179,7 +183,57 @@ async function candidateHosts(token) {
   for (const zone of analytics.data.viewer.zones) for (const g of zone.dnsAnalyticsAdaptiveGroups) hosts.add(g.dimensions.queryName.toLowerCase());
 
   // Skip wildcards, service records, pull request previews and hidden hosts.
-  return [...hosts].filter((h) => !h.includes("*") && !h.startsWith("_") && !h.startsWith("pr.") && !isHidden(h));
+  const usable = [...hosts].filter((h) => !h.includes("*") && !h.startsWith("_") && !h.startsWith("pr.") && !isHidden(h));
+  return { zones: zones.map((z) => z.name), hosts: usable };
+}
+
+// ---------- Certificate dates ----------
+
+// The first TLS certificate of a host is the best public record of when the site went
+// live. Two certificate transparency sources fill one table of earliest dates in KV:
+// - Cert Spotter, every run, from a stored cursor per zone. It returns only unexpired
+//   certificates, so it catches every new host but not old history.
+// - crt.sh, once per zone, for the full history. It often fails, so each run retries one
+//   zone that has no history yet.
+// Both are optional enrichment: a failure is logged and the card still refreshes.
+async function refreshCertDates(env, zones) {
+  const certs = (await env.STATS.get("certs", "json")) ?? { first: {}, cursors: {}, history: {} };
+  const record = (name, date) => {
+    if (name.startsWith("*.")) return;
+    const iso = new Date(date.endsWith("Z") ? date : `${date}Z`).toISOString();
+    if (!certs.first[name] || iso < certs.first[name]) certs.first[name] = iso;
+  };
+  let budget = CERT_REQUESTS_PER_RUN;
+
+  const historyZone = zones.find((z) => !certs.history[z]);
+  if (historyZone) {
+    budget--;
+    try {
+      const response = await fetch(`https://crt.sh/?q=${encodeURIComponent(`%.${historyZone}`)}&output=json`, { signal: AbortSignal.timeout(25000) });
+      if (!response.ok) throw new Error(`crt.sh returned ${response.status}`);
+      for (const entry of await response.json()) for (const name of entry.name_value.split("\n")) record(name.toLowerCase(), entry.not_before);
+      certs.history[historyZone] = true;
+    } catch (error) {
+      console.error(`crt.sh history for ${historyZone} failed, retrying next run: ${error}`);
+    }
+  }
+
+  certSpotter: for (const zone of zones) {
+    for (let more = true; more; ) {
+      if (budget-- <= 0) break certSpotter;
+      const after = certs.cursors[zone] ? `&after=${certs.cursors[zone]}` : "";
+      const response = await fetch(`https://api.certspotter.com/v1/issuances?domain=${zone}&include_subdomains=true&expand=dns_names${after}`);
+      if (response.status === 429) { console.error("Cert Spotter rate limit reached, continuing next run"); break certSpotter; }
+      if (!response.ok) { console.error(`Cert Spotter ${zone} returned ${response.status}`); break; }
+      const issuances = await response.json();
+      for (const issuance of issuances) for (const name of issuance.dns_names) record(name.toLowerCase(), issuance.not_before);
+      if (issuances.length) certs.cursors[zone] = issuances.at(-1).id;
+      more = (response.headers.get("Link") ?? "").includes('rel="next"');
+    }
+  }
+
+  await env.STATS.put("certs", JSON.stringify(certs));
+  return certs.first;
 }
 
 const LOGIN_PATHS = ["/auth", "login", "sign_in", "signin"];
@@ -209,14 +263,25 @@ async function checkSite(host) {
 
 async function refreshSites(env) {
   if (!env.CLOUDFLARE_API_TOKEN) throw new Error("CLOUDFLARE_API_TOKEN secret is not set");
-  const hosts = await candidateHosts(env.CLOUDFLARE_API_TOKEN);
+  const { zones, hosts: found } = await candidateHosts(env.CLOUDFLARE_API_TOKEN);
   const previous = (await env.STATS.get("sites", "json")) ?? {};
+  const now = new Date().toISOString();
+  // State saved before firstLiveAt existed: date those live hosts from now.
+  for (const s of Object.values(previous)) if (s.state === "public" && !s.firstLiveAt) s.firstLiveAt = now;
+  // Keep every host that was ever live, even after a week without DNS lookups, so it
+  // keeps its place and date.
+  const everLive = Object.keys(previous).filter((h) => previous[h].firstLiveAt && !isHidden(h));
+  const hosts = [...new Set([...found, ...everLive])];
   const state = Object.fromEntries(hosts.map((h) => [h, previous[h] ?? { checkedAt: 0 }]));
 
   const due = hosts.sort((a, b) => state[a].checkedAt - state[b].checkedAt).slice(0, SITE_CHECKS_PER_RUN);
-  const results = await Promise.all(due.map(checkSite));
-  due.forEach((host, i) => { state[host] = { ...results[i], checkedAt: Date.now() }; });
+  const [results, certDates] = await Promise.all([Promise.all(due.map(checkSite)), refreshCertDates(env, zones)]);
+  due.forEach((host, i) => {
+    const firstLiveAt = state[host].firstLiveAt ?? (results[i].state === "public" ? now : undefined);
+    state[host] = { ...results[i], checkedAt: Date.now(), ...(firstLiveAt && { firstLiveAt }) };
+  });
   await env.STATS.put("sites", JSON.stringify(state));
+  const since = (host) => certDates[host] ?? state[host].firstLiveAt;
 
   // One site often answers on several hosts (apex, www, an alias domain). Keep the
   // shortest host per page title.
@@ -225,10 +290,14 @@ async function refreshSites(env) {
     if (s.state !== "public" || isHidden(host)) continue;
     const key = s.title || host;
     const kept = byTitle.get(key);
-    if (!kept || host.length < kept.host.length) byTitle.set(key, { host, title: s.title ?? "" });
+    const date = since(host);
+    const earliest = kept && kept.since < date ? kept.since : date;
+    if (!kept || host.length < kept.host.length) byTitle.set(key, { host, title: s.title ?? "", since: earliest });
+    else kept.since = earliest;
   }
   return {
-    live: [...byTitle.values()].sort((a, b) => a.host.localeCompare(b.host)),
+    // Newest first.
+    live: [...byTitle.values()].sort((a, b) => b.since.localeCompare(a.since)),
     gated: Object.values(state).filter((s) => s.state === "gated").length,
   };
 }
@@ -407,7 +476,7 @@ function svgResponse(svg) {
 
 // A ticket stub per live site. The README links each one, because links inside an
 // image do not work on GitHub.
-function renderChip({ host, title }) {
+function renderChip({ host, title, since }) {
   const label = host.startsWith("www.") ? host.slice(4) : host;
   const parts = label.split(".");
   const domain = parts.slice(-2).join(".");
@@ -423,7 +492,7 @@ function renderChip({ host, title }) {
 <style>${STYLE}</style>
 <path class="paper" d="${ticket}"/>
 <line class="rule" x1="${stub}" x2="${stub}" y1="4" y2="${h - 4}" stroke-dasharray="2 3"/>
-<text class="faded" x="${stub / 2 + 1}" y="${h / 2 + 4}" font-size="11" text-anchor="middle">↗</text>
+<text class="faded" x="${stub / 2 + 1}" y="${h / 2 + 3.5}" font-size="9.5" text-anchor="middle">${since ? `’${since.slice(2, 4)}` : "↗"}</text>
 <text x="${stub + 12}" y="${h / 2 + 4}" font-size="12">${text}</text>
 </svg>
 `;
