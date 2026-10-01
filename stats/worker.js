@@ -281,7 +281,10 @@ async function refreshSites(env) {
     state[host] = { ...results[i], checkedAt: Date.now(), ...(firstLiveAt && { firstLiveAt }) };
   });
   await env.STATS.put("sites", JSON.stringify(state));
-  const since = (host) => certDates[host] ?? state[host].firstLiveAt;
+  // "born" holds dates set by hand, such as the creation date of the repo behind a site.
+  // They win over certificate dates, which only bound when a site went live.
+  const born = (await env.STATS.get("born", "json")) ?? {};
+  const since = (host) => born[host] ?? certDates[host] ?? state[host].firstLiveAt;
 
   // One site often answers on several hosts (apex, www, an alias domain). Keep the
   // shortest host per page title.
