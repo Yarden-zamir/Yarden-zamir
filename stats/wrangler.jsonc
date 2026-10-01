@@ -1,0 +1,11 @@
+{
+  "name": "github-stats",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-01",
+  // Fetch own hostnames through the public internet, so the site check also reaches other Workers on these zones.
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "kv_namespaces": [{ "binding": "STATS", "id": "5ea0dc9e51194e79bc21bccc549e0d68" }],
+  "triggers": { "crons": ["*/30 * * * *"] },
+  "preview_urls": false,
+  "routes": [{ "pattern": "github-stats.yarden-zamir.com", "custom_domain": true }]
+}
