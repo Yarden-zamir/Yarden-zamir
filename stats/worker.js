@@ -20,17 +20,31 @@ const IGNORED_HEADLINES = new Set(["chore: add MIT license"]);
 // GitHub and Cloudflare, so it checks at most this many sites and rotates through the rest.
 const SITE_CHECKS_PER_RUN = 30;
 const SITE_LOOKBACK_DAYS = 7;
+// Hosts that stay off the profile. Each entry hides that host and all its subdomains.
+const HIDDEN = ["example.yarden-zamir.com", "shahar-zamir.com"];
+const isHidden = (host) => HIDDEN.some((h) => host === h || host.endsWith(`.${h}`));
+// The README holds this many site slots: /site/<n>.svg draws slot n, /go/<n> opens it.
+// An image inside an <img> cannot hold links, so each site is its own linked image.
+// Limit: live sites beyond this count are not shown. Revisit when the list outgrows it.
+const SITE_SLOTS = 20;
+const PROFILE_URL = `https://github.com/${LOGIN}`;
 
 export default {
   async fetch(request, env) {
     const snapshot = await env.STATS.get("snapshot", "json");
     if (!snapshot) return new Response("The first cron run has not finished yet", { status: 503 });
-    return new Response(renderCard(snapshot), {
-      headers: {
-        "Content-Type": "image/svg+xml; charset=utf-8",
-        "Cache-Control": `public, max-age=${CARD_CACHE_SECONDS}`,
-      },
-    });
+    // Hide right away, without waiting for the next cron run to rebuild the list.
+    snapshot.sites.live = snapshot.sites.live.filter((site) => !isHidden(site.host));
+
+    const [, route = "", slotName = ""] = new URL(request.url).pathname.split("/");
+    if (route === "") return svgResponse(renderCard(snapshot));
+
+    const slot = Number(slotName.endsWith(".svg") ? slotName.slice(0, -4) : slotName);
+    if (!Number.isInteger(slot) || slot < 0 || slot >= SITE_SLOTS) return new Response("Not found", { status: 404 });
+    const site = snapshot.sites.live[slot];
+    if (route === "site") return svgResponse(site ? renderChip(site) : EMPTY_SVG);
+    if (route === "go") return Response.redirect(site ? `https://${site.host}/` : PROFILE_URL, 302);
+    return new Response("Not found", { status: 404 });
   },
 
   async scheduled(event, env) {
@@ -164,8 +178,8 @@ async function candidateHosts(token) {
   if (analytics.errors?.length) throw new Error(`Cloudflare analytics errors: ${JSON.stringify(analytics.errors)}`);
   for (const zone of analytics.data.viewer.zones) for (const g of zone.dnsAnalyticsAdaptiveGroups) hosts.add(g.dimensions.queryName.toLowerCase());
 
-  // Skip wildcards, service records and pull request previews.
-  return [...hosts].filter((h) => !h.includes("*") && !h.startsWith("_") && !h.startsWith("pr."));
+  // Skip wildcards, service records, pull request previews and hidden hosts.
+  return [...hosts].filter((h) => !h.includes("*") && !h.startsWith("_") && !h.startsWith("pr.") && !isHidden(h));
 }
 
 const LOGIN_PATHS = ["/auth", "login", "sign_in", "signin"];
@@ -208,7 +222,7 @@ async function refreshSites(env) {
   // shortest host per page title.
   const byTitle = new Map();
   for (const [host, s] of Object.entries(state)) {
-    if (s.state !== "public") continue;
+    if (s.state !== "public" || isHidden(host)) continue;
     const key = s.title || host;
     const kept = byTitle.get(key);
     if (!kept || host.length < kept.host.length) byTitle.set(key, { host, title: s.title ?? "" });
@@ -241,158 +255,176 @@ function rank({ commits, prs, issues, reviews, stars, followers }) {
   return { level, percentile };
 }
 
-const compact = new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 });
-const format = (n) => compact.format(n).toLowerCase();
 const full = new Intl.NumberFormat("en");
 const escapeXml = (s) => s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 
-const WIDTH = 480;
-const LEFT = 28;
-const INNER = WIDTH - 2 * LEFT;
+// The card is a printed receipt. Monospace ink, so text width is predictable:
+// one character is about 0.6 of the font size.
+const WIDTH = 440;
+const PAD = 30;
+const RIGHT = WIDTH - PAD;
+const MONO = `ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
+const CHAR = 0.6 * 13;
 
-function sparkline(weekly, top) {
-  const slots = 53;
-  const step = INNER / slots;
+const STYLE = `
+  text { font-family: ${MONO}; fill: var(--ink); }
+  svg { --paper: #fbf8f1; --edge: #e6dfd2; --ink: #2a2622; --faded: #8c857a; --stamp: #c8402b; }
+  @media (prefers-color-scheme: dark) {
+    svg { --paper: #23221f; --edge: #3a3833; --ink: #ece4d6; --faded: #8f897e; --stamp: #f0694f; }
+  }
+  .paper { fill: var(--paper); stroke: var(--edge); }
+  .faded { fill: var(--faded); }
+  .ink { fill: var(--ink); }
+  .rule { stroke: var(--faded); stroke-dasharray: 4 4; }
+  .leader { stroke: var(--faded); stroke-width: 1.4; stroke-linecap: round; stroke-dasharray: 0.1 5; }
+  .stamp { fill: none; stroke: var(--stamp); }
+  .stamptext { fill: var(--stamp); font-weight: 800; }
+  .line { animation: print 260ms steps(4) both; }
+  @keyframes print { from { opacity: 0; transform: translateY(-3px); } }
+  @media (prefers-reduced-motion: reduce) { .line { animation: none; } }
+`;
+
+// Torn paper: a zigzag along the top and bottom edges.
+function receiptPath(height) {
+  const tooth = 10;
+  const depth = 5;
+  const teeth = Math.ceil(WIDTH / tooth);
+  let d = `M0 ${depth}`;
+  for (let i = 0; i < teeth; i++) d += ` L${i * tooth + tooth / 2} 0 L${Math.min(WIDTH, (i + 1) * tooth)} ${depth}`;
+  d += ` L${WIDTH} ${height - depth}`;
+  for (let i = teeth - 1; i >= 0; i--) d += ` L${i * tooth + tooth / 2} ${height} L${i * tooth} ${height - depth}`;
+  return `${d} Z`;
+}
+
+// Weekly contributions become a barcode: busier weeks print thicker bars.
+function barcode(weekly, top) {
   const max = Math.max(1, ...weekly);
-  const height = 34;
-  return Array.from({ length: slots }, (_, i) => {
-    const x = (LEFT + i * step).toFixed(1);
-    if (i >= weekly.length) return `<rect class="future" x="${x}" y="${top + height - 2}" width="${(step - 2).toFixed(1)}" height="2" rx="1"/>`;
-    const h = Math.max(2, (weekly[i] / max) * height);
-    return `<rect class="bar" x="${x}" y="${(top + height - h).toFixed(1)}" width="${(step - 2).toFixed(1)}" height="${h.toFixed(1)}" rx="1.5" style="animation-delay:${i * 12}ms"/>`;
+  const widths = weekly.map((w) => 1 + Math.round(Math.sqrt(w / max) * 4));
+  const gap = 2;
+  const total = widths.reduce((s, w) => s + w + gap, -gap);
+  let x = (WIDTH - total) / 2;
+  return widths.map((w) => {
+    const bar = `<rect class="ink" x="${x.toFixed(1)}" y="${top}" width="${w}" height="46"/>`;
+    x += w + gap;
+    return bar;
   }).join("");
 }
+
+const tombstone = (x, y) => `<path class="faded" d="M${x} ${y + 13}v-8a3.5 3.5 0 0 1 7 0v8z"/><path d="M${x + 3.5} ${y + 4}v5M${x + 2} ${y + 5.5}h3" stroke="var(--paper)" stroke-width="1"/>`;
+const suitcase = (x, y) => `<rect class="faded" x="${x}" y="${y + 4}" width="8" height="9" rx="1.5"/><path d="M${x + 2.5} ${y + 4}v-2h3v2" fill="none" stroke="var(--faded)" stroke-width="1.3"/>`;
 
 function iconRow(count, top, draw) {
   const step = 10;
-  const fits = Math.floor(INNER / step);
-  const shown = count > fits ? fits - 3 : count;
-  const icons = Array.from({ length: shown }, (_, i) => draw(LEFT + i * step, top)).join("");
-  const rest = count - shown;
-  return rest > 0 ? `${icons}<text class="small" x="${LEFT + shown * step + 4}" y="${top + 12}">+${rest}</text>` : icons;
-}
-const tombstone = (x, y) => `<path class="grave" d="M${x} ${y + 14}v-9a3.5 3.5 0 0 1 7 0v9z"/>`;
-const suitcase = (x, y) => `<g class="tourist"><rect x="${x}" y="${y + 5}" width="8" height="9" rx="1.5"/><path d="M${x + 2.5} ${y + 5}v-2h3v2" fill="none"/></g>`;
-
-function chips(sites, top) {
-  const out = [];
-  let x = LEFT;
-  let y = top;
-  for (const { host, title } of sites) {
-    const label = host.startsWith("www.") ? host.slice(4) : host;
-    // Dim the registered domain so the part that names the site stands out.
-    const parts = label.split(".");
-    const domain = parts.slice(-2).join(".");
-    const sub = parts.slice(0, -2).join(".");
-    const width = Math.round(label.length * 6.4 + 32);
-    if (x + width > WIDTH - LEFT) { x = LEFT; y += 30; }
-    out.push(`<g><title>${escapeXml(title || label)}</title><rect class="chip" x="${x}" y="${y}" width="${width}" height="22" rx="11"/><circle class="live" cx="${x + 12}" cy="${y + 11}" r="3.5"/><text class="chiptext" x="${x + 21}" y="${y + 15}">${sub ? `${escapeXml(sub)}<tspan class="domain">.${escapeXml(domain)}</tspan>` : escapeXml(domain)}</text></g>`);
-    x += width + 8;
-  }
-  return { svg: out.join(""), bottom: sites.length ? y + 22 : top };
+  const fits = Math.floor((RIGHT - PAD) / step);
+  const shown = count > fits ? fits - 4 : count;
+  const icons = Array.from({ length: shown }, (_, i) => draw(PAD + i * step, top)).join("");
+  return count > shown ? `${icons}<text class="faded" x="${PAD + shown * step + 4}" y="${top + 12}" font-size="11">+${count - shown}</text>` : icons;
 }
 
-function renderCard({ stats, sites }) {
+function renderCard({ stats, sites, updatedAt }) {
   const { level, percentile } = rank(stats);
-  const ringR = 30;
-  const circumference = 2 * Math.PI * ringR;
+  const top = Math.max(1, Math.round(percentile));
+  const printed = new Date(updatedAt).toISOString().slice(0, 16).replace("T", " ");
+  const lines = [];
+  let y = 0;
+  let delay = 0;
+  const add = (svg, advance) => {
+    y += advance;
+    lines.push(`<g class="line" style="animation-delay:${(delay += 45)}ms">${svg(y)}</g>`);
+  };
+  const center = (text, cls, size, extra = "") => (ty) => `<text class="${cls}" x="${WIDTH / 2}" y="${ty}" font-size="${size}" text-anchor="middle" ${extra}>${text}</text>`;
+  const rule = (ty) => `<line class="rule" x1="${PAD}" x2="${RIGHT}" y1="${ty}" y2="${ty}"/>`;
+  const item = (label, value) => (ty) => {
+    const v = full.format(value);
+    const from = PAD + label.length * CHAR + 8;
+    const to = RIGHT - v.length * CHAR - 8;
+    return `<text x="${PAD}" y="${ty}" font-size="13">${label}</text><line class="leader" x1="${from}" x2="${to}" y1="${ty - 3}" y2="${ty - 3}"/><text x="${RIGHT}" y="${ty}" font-size="13" font-weight="700" text-anchor="end">${v}</text>`;
+  };
 
-  const grid = [
-    ["Stars earned", stats.stars], ["Contributed to", stats.contributedTo],
-    [`Commits in ${stats.year}`, stats.commits], ["Releases shipped", stats.releases],
-    ["Pull requests", stats.prs], [`New projects in ${stats.year}`, stats.newProjects],
-    ["Issues", stats.issues], ["Code reviews", stats.reviews],
+  add(center(`${escapeXml(stats.name.toUpperCase())}`, "ink", 18, 'font-weight="800" letter-spacing="2"'), 44);
+  add(center(`github.com/${LOGIN}`, "faded", 11.5), 18);
+  add(center(`RECEIPT NO. ${stats.year} · PRINTED ${printed} UTC`, "faded", 10, 'letter-spacing="0.5"'), 16);
+  add(rule, 18);
+
+  add(center(full.format(stats.contributions), "ink", 40, 'font-weight="800"'), 52);
+  add(center(`CONTRIBUTIONS IN ${stats.year}`, "faded", 11, 'letter-spacing="2"'), 20);
+  add((ty) => barcode(stats.weekly, ty), 14);
+  add(center(`* ${String(stats.contributions).padStart(7, "0")} ${stats.year} *`, "faded", 10, 'letter-spacing="4"'), 62);
+  add(rule, 18);
+
+  const items = [
+    ["STARS EARNED", stats.stars],
+    [`COMMITS ${stats.year}`, stats.commits],
+    ["PULL REQUESTS", stats.prs],
+    ["ISSUES", stats.issues],
+    ["CONTRIBUTED TO", stats.contributedTo],
+    ["RELEASES SHIPPED", stats.releases],
+    [`NEW PROJECTS ${stats.year}`, stats.newProjects],
   ];
-  const gridTop = 236;
-  const gridSvg = grid.map(([label, value], i) => {
-    const column = i % 2;
-    const y = gridTop + Math.floor(i / 2) * 26;
-    const x = column === 0 ? LEFT : WIDTH / 2 + 8;
-    const valueX = column === 0 ? WIDTH / 2 - 16 : WIDTH - LEFT;
-    return `<g class="row" style="animation-delay:${300 + i * 50}ms"><text class="label" x="${x}" y="${y}">${label}</text><text class="value" x="${valueX}" y="${y}" text-anchor="end">${format(value)}</text></g>`;
-  }).join("");
+  items.forEach(([label, value], i) => add(item(label, value), i === 0 ? 28 : 23));
+  const stampY = y - 80;
+  add(rule, 22);
 
-  const funTop = gridTop + 4 * 26 + 18;
-  const sitesTop = funTop + 104;
-  const siteChips = chips(sites.live, sitesTop + 14);
-  const gatedNote = sites.gated ? `<text class="small" x="${WIDTH - LEFT}" y="${sitesTop}" text-anchor="end">+${sites.gated} behind a login</text>` : "";
-  const height = siteChips.bottom + 26;
+  add(item("GRAVEYARD", stats.graveyard), 26);
+  add((ty) => `<text class="faded" x="${PAD}" y="${ty}" font-size="10.5">projects with no commit from me in 2+ years</text>`, 16);
+  add((ty) => iconRow(stats.graveyard, ty, tombstone), 8);
+  add(item("TOURIST FORKS", stats.touristForks), 36);
+  add((ty) => `<text class="faded" x="${PAD}" y="${ty}" font-size="10.5">forked, looked around, never committed</text>`, 16);
+  add((ty) => iconRow(stats.touristForks, ty, suitcase), 8);
+  add(rule, 32);
+
+  const gated = sites.gated ? ` · +${sites.gated} BEHIND A LOGIN` : "";
+  add(center(`LIVE ON THE WEB: ${sites.live.length} SITES${gated}`, "ink", 11, 'font-weight="700" letter-spacing="1"'), 24);
+  add(center("tear off a ticket below ✂", "faded", 10.5), 16);
+  add(center("NO REFUNDS ON ABANDONED PROJECTS", "faded", 9.5, 'letter-spacing="1.5"'), 24);
+  const height = y + 22;
+
+  // A rubber stamp, slightly crooked, over the line items.
+  const stamp = `<g transform="translate(${RIGHT - 92} ${stampY}) rotate(-13)" opacity="0.88">
+    <circle class="stamp" r="40" stroke-width="2.5"/><circle class="stamp" r="34" stroke-width="1"/>
+    <text class="stamptext" y="-15" font-size="9" text-anchor="middle" letter-spacing="2">GRADE</text>
+    <text class="stamptext" y="13" font-size="30" text-anchor="middle">${level}</text>
+    <text class="stamptext" y="27" font-size="8.5" text-anchor="middle" letter-spacing="1">TOP ${top}%</text>
+  </g>`;
 
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${height}" viewBox="0 0 ${WIDTH} ${height}" role="img" aria-labelledby="title">
-<title id="title">${escapeXml(stats.name)}'s GitHub stats: ${full.format(stats.contributions)} contributions in ${stats.year}, grade ${level}</title>
-<style>
-  text { font-family: ui-sans-serif, -apple-system, "Segoe UI", sans-serif; }
-  .card { fill: #fbf7f1; stroke: #eadfce; }
-  .name { fill: #c4573a; font-size: 18px; font-weight: 600; }
-  .caps { fill: #9a8a78; font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
-  .hero { fill: #2b2420; font-size: 40px; font-weight: 700; font-variant-numeric: tabular-nums; }
-  .herolabel { fill: #6b5d4f; font-size: 14px; }
-  .label { fill: #6b5d4f; font-size: 13.5px; }
-  .value { fill: #2b2420; font-size: 13.5px; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .small { fill: #9a8a78; font-size: 11.5px; }
-  .funlabel { fill: #2b2420; font-size: 13.5px; font-weight: 600; }
-  .bar { fill: #c4573a; transform-box: fill-box; transform-origin: bottom; animation: grow 500ms ease-out both; }
-  .future { fill: #eadfce; }
-  .track { stroke: #eadfce; }
-  .ring { stroke: #c4573a; animation: draw 900ms ease-out both; }
-  .grade { fill: #2b2420; font-size: 20px; font-weight: 700; }
-  .grave { fill: #b4a796; }
-  .tourist rect { fill: #e0a458; }
-  .tourist path { stroke: #e0a458; stroke-width: 1.4; }
-  .chip { fill: #f3ebdf; stroke: #eadfce; }
-  .chiptext { fill: #2b2420; font-size: 12px; font-weight: 500; }
-  .domain { fill: #9a8a78; font-weight: 400; }
-  .live { fill: #3fa66b; }
-  .rule { stroke: #eadfce; }
-  @media (prefers-color-scheme: dark) {
-    .card { fill: #22262f; stroke: #343a46; }
-    .name { fill: #e8876b; }
-    .caps, .small { fill: #8d8577; }
-    .hero, .value, .grade, .funlabel, .chiptext { fill: #f3e9da; }
-    .herolabel, .label { fill: #b9ae9d; }
-    .bar { fill: #e8876b; }
-    .ring { stroke: #e8876b; }
-    .future, .chip { fill: #2c313c; }
-    .track, .rule, .chip { stroke: #343a46; }
-    .grave { fill: #6d6a66; }
-    .domain { fill: #8d8577; }
-    .live { fill: #4cc083; }
-  }
-  .row { animation: fade 400ms ease-out both; }
-  @keyframes fade { from { opacity: 0; } }
-  @keyframes grow { from { transform: scaleY(0); } }
-  @keyframes draw { from { stroke-dashoffset: ${circumference.toFixed(2)}; } }
-  @media (prefers-reduced-motion: reduce) { .row, .bar, .ring { animation: none; } }
-</style>
-<rect class="card" x="0.5" y="0.5" width="${WIDTH - 1}" height="${height - 1}" rx="18"/>
+<title id="title">${escapeXml(stats.name)}'s GitHub receipt: ${full.format(stats.contributions)} contributions in ${stats.year}, grade ${level}</title>
+<style>${STYLE}</style>
+<path class="paper" d="${receiptPath(height)}"/>
+${lines.join("\n")}
+${stamp}
+</svg>
+`;
+}
 
-<text class="name" x="${LEFT}" y="40">${escapeXml(stats.name)}</text>
-<text class="caps" x="${LEFT}" y="58">GITHUB · ${stats.year}</text>
-<g transform="translate(${WIDTH - LEFT - ringR} 62)">
-  <circle class="track" r="${ringR}" fill="none" stroke-width="6"/>
-  <circle class="ring" r="${ringR}" fill="none" stroke-width="6" stroke-linecap="round" transform="rotate(-90)"
-    stroke-dasharray="${circumference.toFixed(2)}" stroke-dashoffset="${(circumference * percentile / 100).toFixed(2)}"/>
-  <text class="grade" y="7" text-anchor="middle">${level}</text>
-  <text class="small" y="${ringR + 18}" text-anchor="middle">top ${Math.max(1, Math.round(percentile))}%</text>
-</g>
+const EMPTY_SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>';
 
-<text class="hero" x="${LEFT}" y="118">${full.format(stats.contributions)}</text>
-<text class="herolabel" x="${LEFT}" y="140">contributions in ${stats.year}</text>
-${sparkline(stats.weekly, 156)}
+function svgResponse(svg) {
+  return new Response(svg, {
+    headers: { "Content-Type": "image/svg+xml; charset=utf-8", "Cache-Control": `public, max-age=${CARD_CACHE_SECONDS}` },
+  });
+}
 
-<line class="rule" x1="${LEFT}" x2="${WIDTH - LEFT}" y1="${gridTop - 24}" y2="${gridTop - 24}"/>
-${gridSvg}
-
-<line class="rule" x1="${LEFT}" x2="${WIDTH - LEFT}" y1="${funTop - 14}" y2="${funTop - 14}"/>
-<text class="funlabel" x="${LEFT}" y="${funTop + 4}">Graveyard <tspan class="small">· ${stats.graveyard} projects without a commit from me in 2+ years</tspan></text>
-${iconRow(stats.graveyard, funTop + 12, tombstone)}
-<text class="funlabel" x="${LEFT}" y="${funTop + 52}">Tourist forks <tspan class="small">· ${stats.touristForks} forks I never committed to</tspan></text>
-${iconRow(stats.touristForks, funTop + 60, suitcase)}
-
-<line class="rule" x1="${LEFT}" x2="${WIDTH - LEFT}" y1="${sitesTop - 18}" y2="${sitesTop - 18}"/>
-<text class="caps" x="${LEFT}" y="${sitesTop}">LIVE ON THE WEB</text>
-${gatedNote}
-${siteChips.svg}
+// A ticket stub per live site. The README links each one, because links inside an
+// image do not work on GitHub.
+function renderChip({ host, title }) {
+  const label = host.startsWith("www.") ? host.slice(4) : host;
+  const parts = label.split(".");
+  const domain = parts.slice(-2).join(".");
+  const sub = parts.slice(0, -2).join(".");
+  const h = 30;
+  const r = 5;
+  const stub = 26;
+  const w = Math.round(stub + 12 + label.length * 0.6 * 12 + 14);
+  const text = sub ? `<tspan font-weight="700">${escapeXml(sub)}</tspan><tspan class="faded">.${escapeXml(domain)}</tspan>` : `<tspan font-weight="700">${escapeXml(domain)}</tspan>`;
+  const ticket = `M3 0H${w - 3}Q${w} 0 ${w} 3V${h / 2 - r}A${r} ${r} 0 0 0 ${w} ${h / 2 + r}V${h - 3}Q${w} ${h} ${w - 3} ${h}H3Q0 ${h} 0 ${h - 3}V${h / 2 + r}A${r} ${r} 0 0 0 0 ${h / 2 - r}V3Q0 0 3 0Z`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="${escapeXml(title || label)}">
+<title>${escapeXml(title || label)}</title>
+<style>${STYLE}</style>
+<path class="paper" d="${ticket}"/>
+<line class="rule" x1="${stub}" x2="${stub}" y1="4" y2="${h - 4}" stroke-dasharray="2 3"/>
+<text class="faded" x="${stub / 2 + 1}" y="${h / 2 + 4}" font-size="11" text-anchor="middle">↗</text>
+<text x="${stub + 12}" y="${h / 2 + 4}" font-size="12">${text}</text>
 </svg>
 `;
 }
