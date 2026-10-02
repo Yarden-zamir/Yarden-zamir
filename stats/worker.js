@@ -41,6 +41,7 @@ export default {
 
     const [, route = "", slotName = ""] = new URL(request.url).pathname.split("/");
     if (route === "") return svgResponse(renderCard(snapshot));
+    if (route === "tap.svg") return snapshot.tap ? svgResponse(renderTap(snapshot.tap)) : new Response("No tap data yet", { status: 503 });
 
     const slot = Number(slotName.endsWith(".svg") ? slotName.slice(0, -4) : slotName);
     if (!Number.isInteger(slot) || slot < 0 || slot >= SITE_SLOTS) return new Response("Not found", { status: 404 });
@@ -51,8 +52,9 @@ export default {
   },
 
   async scheduled(event, env) {
-    const [stats, sites] = await Promise.all([fetchStats(env.GITHUB_TOKEN), refreshSites(env)]);
-    await env.STATS.put("snapshot", JSON.stringify({ stats, sites, updatedAt: new Date().toISOString() }));
+    const previous = await env.STATS.get("snapshot", "json");
+    const [stats, sites, tap] = await Promise.all([fetchStats(env.GITHUB_TOKEN), refreshSites(env), fetchTap(previous?.tap)]);
+    await env.STATS.put("snapshot", JSON.stringify({ stats, sites, tap, updatedAt: new Date().toISOString() }));
   },
 };
 
@@ -144,6 +146,26 @@ async function fetchStats(token) {
     graveyard: projects.filter(isGrave).length,
     touristForks: repos.filter((r) => r.isFork && ownCommits(r).length === 0).length,
   };
+}
+
+// ---------- Homebrew tap ----------
+
+const TAP_SITE = "https://brew.yarden-zamir.com";
+
+// The tap page publishes its formula list as JSON. Optional: on failure keep the last list.
+async function fetchTap(previous) {
+  try {
+    const response = await fetch(`${TAP_SITE}/formulae.json`, { signal: AbortSignal.timeout(10000) });
+    if (!response.ok) throw new Error(`returned ${response.status}`);
+    const { formulae } = await response.json();
+    if (!Array.isArray(formulae) || !formulae.length) throw new Error("no formulae in the list");
+    return formulae
+      .map(({ name, version, desc, updatedAt }) => ({ name, version, desc, updatedAt: updatedAt ?? "" }))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  } catch (error) {
+    console.error(`Tap list from ${TAP_SITE} failed, keeping the last one: ${error}`);
+    return previous ?? null;
+  }
 }
 
 // ---------- Sites ----------
@@ -239,26 +261,34 @@ async function refreshCertDates(env, zones) {
 const LOGIN_PATHS = ["/auth", "login", "sign_in", "signin"];
 
 async function checkSite(host) {
+  let response;
   try {
-    const response = await fetch(`https://${host}/`, {
+    response = await fetch(`https://${host}/`, {
       redirect: "manual",
       signal: AbortSignal.timeout(5000),
       headers: { "User-Agent": "github-stats.yarden-zamir.com site check" },
     });
-    if (response.status >= 300 && response.status < 400) {
-      const target = new URL(response.headers.get("Location") ?? "/", `https://${host}/`);
-      if (target.host !== host) return { state: "redirect" };
-      return { state: LOGIN_PATHS.some((p) => target.pathname.includes(p)) ? "gated" : "public" };
-    }
-    if (response.status === 401 || response.status === 403) return { state: "gated" };
-    if (!response.ok || !(response.headers.get("Content-Type") ?? "").includes("text/html")) return { state: "down" };
-
-    let title = "";
-    await new HTMLRewriter().on("title", { text: (t) => { title += t.text; } }).transform(response).arrayBuffer();
-    return { state: "public", title: title.trim() };
   } catch {
     return { state: "down" };
   }
+  // Close every body this check does not read. An open body holds one of the few
+  // connections a Worker may keep, and the next fetch stalls behind it.
+  const skip = (state) => { response.body?.cancel(); return { state }; };
+  if (response.status >= 300 && response.status < 400) {
+    const target = new URL(response.headers.get("Location") ?? "/", `https://${host}/`);
+    if (target.host !== host) return skip("redirect");
+    return skip(LOGIN_PATHS.some((p) => target.pathname.includes(p)) ? "gated" : "public");
+  }
+  if (response.status === 401 || response.status === 403) return skip("gated");
+  if (!response.ok || !(response.headers.get("Content-Type") ?? "").includes("text/html")) return skip("down");
+
+  let title = "";
+  try {
+    await new HTMLRewriter().on("title", { text: (t) => { title += t.text; } }).transform(response).arrayBuffer();
+  } catch {
+    // The page answered but its body broke off. It is still live.
+  }
+  return { state: "public", title: title.trim() };
 }
 
 async function refreshSites(env) {
@@ -357,13 +387,13 @@ const STYLE = `
 `;
 
 // Torn paper: a zigzag along the top and bottom edges.
-function receiptPath(height) {
+function receiptPath(height, width = WIDTH) {
   const tooth = 10;
   const depth = 5;
-  const teeth = Math.ceil(WIDTH / tooth);
+  const teeth = Math.ceil(width / tooth);
   let d = `M0 ${depth}`;
-  for (let i = 0; i < teeth; i++) d += ` L${i * tooth + tooth / 2} 0 L${Math.min(WIDTH, (i + 1) * tooth)} ${depth}`;
-  d += ` L${WIDTH} ${height - depth}`;
+  for (let i = 0; i < teeth; i++) d += ` L${i * tooth + tooth / 2} 0 L${Math.min(width, (i + 1) * tooth)} ${depth}`;
+  d += ` L${width} ${height - depth}`;
   for (let i = teeth - 1; i >= 0; i--) d += ` L${i * tooth + tooth / 2} ${height} L${i * tooth} ${height - depth}`;
   return `${d} Z`;
 }
@@ -446,7 +476,7 @@ function renderCard({ stats, sites, updatedAt }) {
   add(rule, 32);
 
   add(center(`LIVE ON THE WEB: ${sites.live.length}`, "ink", 11, 'font-weight="700" letter-spacing="1"'), 24);
-  add(center("tear off a ticket below ✂", "faded", 10.5), 16);
+  add(center("tear off a ticket ✂", "faded", 10.5), 16);
   add(center("NO REFUNDS ON ABANDONED PROJECTS", "faded", 9.5, 'letter-spacing="1.5"'), 24);
   const height = y + 22;
 
@@ -474,6 +504,34 @@ function svgResponse(svg) {
   return new Response(svg, {
     headers: { "Content-Type": "image/svg+xml; charset=utf-8", "Cache-Control": `public, max-age=${CARD_CACHE_SECONDS}` },
   });
+}
+
+// A small receipt of the Homebrew tap, newest first. The README links it to the tap page.
+function renderTap(formulae) {
+  const width = 420;
+  const pad = 26;
+  const right = width - pad;
+  const rows = formulae.map((f, i) => {
+    const y = 104 + i * 23;
+    const from = pad + f.name.length * CHAR + 8;
+    const to = right - f.version.length * 0.6 * 12 - 8;
+    return `<g class="line" style="animation-delay:${i * 45}ms"><title>${escapeXml(f.desc)}</title><text x="${pad}" y="${y}" font-size="13" font-weight="700">${escapeXml(f.name)}</text><line class="leader" x1="${from}" x2="${to}" y1="${y - 3}" y2="${y - 3}"/><text class="faded" x="${right}" y="${y}" font-size="12" text-anchor="end">${escapeXml(f.version)}</text></g>`;
+  }).join("\n");
+  const bottom = 104 + (formulae.length - 1) * 23;
+  const height = bottom + 92;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-labelledby="title">
+<title id="title">Homebrew tap yarden-zamir/tap: ${formulae.length} tools</title>
+<style>${STYLE}</style>
+<path class="paper" d="${receiptPath(height, width)}"/>
+<text x="${width / 2}" y="40" font-size="16" font-weight="800" letter-spacing="2" text-anchor="middle">ON TAP</text>
+<text class="faded" x="${width / 2}" y="58" font-size="11" text-anchor="middle">brew.yarden-zamir.com · ${formulae.length} tools · newest first</text>
+<line class="rule" x1="${pad}" x2="${right}" y1="76" y2="76"/>
+${rows}
+<line class="rule" x1="${pad}" x2="${right}" y1="${bottom + 22}" y2="${bottom + 22}"/>
+<text x="${width / 2}" y="${bottom + 46}" font-size="12" font-weight="700" text-anchor="middle">$ brew tap yarden-zamir/tap</text>
+<text class="faded" x="${width / 2}" y="${bottom + 64}" font-size="10.5" text-anchor="middle">click to open the menu and build an order</text>
+</svg>
+`;
 }
 
 // A ticket stub per live site. The README links each one, because links inside an
