@@ -445,8 +445,7 @@ function renderCard({ stats, sites, updatedAt }) {
   add((ty) => iconRow(stats.touristForks, ty, suitcase), 8);
   add(rule, 32);
 
-  const gated = sites.gated ? ` · +${sites.gated} BEHIND A LOGIN` : "";
-  add(center(`LIVE ON THE WEB: ${sites.live.length} SITES${gated}`, "ink", 11, 'font-weight="700" letter-spacing="1"'), 24);
+  add(center(`LIVE ON THE WEB: ${sites.live.length}`, "ink", 11, 'font-weight="700" letter-spacing="1"'), 24);
   add(center("tear off a ticket below ✂", "faded", 10.5), 16);
   add(center("NO REFUNDS ON ABANDONED PROJECTS", "faded", 9.5, 'letter-spacing="1.5"'), 24);
   const height = y + 22;
