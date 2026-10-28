@@ -1,0 +1,19 @@
+name: kitshn
+
+# kitshn 2 (https://kit.yarden-zamir.com) bundles stats/worker.js and deploys it as the Worker app of
+# kitshn.config.ts. Only changes of the Worker deploy; the metrics commits of build-metrics.yml do not.
+on:
+  push:
+    branches: [main]
+    paths: [stats/**, kitshn.config.ts, .github/workflows/kitshn.yml]
+  # kitshn 2 agent keys start a build of one branch (K-718).
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  kitshn:
+    uses: Yarden-zamir/kitshn/.github/workflows/kitshn2-deploy.yml@main
+    secrets: inherit
